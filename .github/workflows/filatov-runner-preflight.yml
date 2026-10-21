@@ -1,0 +1,191 @@
+name: FILATOV hosted runner capability probe
+run-name: Hosted Docker + systemd probe (manual)
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filatov-runner-preflight-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Probe actual systemd, writable cgroup v2 and local Docker
+        run: |
+          set -Eeuo pipefail
+          phase='runner identity'
+          reason=''
+          unit_owned=false
+          container_id=''
+          container_removed=false
+          cgroup_dir=''
+          main_pid=''
+          probe_dir=''
+          
+          blocked() { reason="$*"; exit 1; }
+          
+          docker_local() {
+            timeout 45s docker --config "$probe_dir/docker" \
+              --host unix:///var/run/docker.sock "$@"
+          }
+          
+          cleanup() {
+            local failed=0 label description
+            if [[ "$container_removed" == false && -z "$container_id" && -n "$probe_dir" && -s "$probe_dir/container.cid" ]]; then
+              container_id=$(< "$probe_dir/container.cid")
+              [[ "$container_id" =~ ^[a-f0-9]{64}$ ]] || return 1
+            fi
+            if [[ -n "$container_id" ]]; then
+              label=$(docker_local inspect --format '{{ index .Config.Labels "org.filatov.runner-preflight" }}' "$container_id") || return 1
+              [[ "$label" == "$probe_id" ]] || return 1
+              if [[ $(docker_local inspect --format '{{.State.Running}}' "$container_id") == true ]]; then
+                docker_local stop --time 2 "$container_id" || failed=1
+              fi
+              docker_local rm "$container_id" || failed=1
+              if (( failed == 0 )); then container_id=''; container_removed=true; fi
+            fi
+            if [[ "$unit_owned" == true ]]; then
+              if [[ $(systemctl show "$unit" --property=LoadState --value) != not-found ]]; then
+                description=$(systemctl show "$unit" --property=Description --value) || return 1
+                [[ "$description" == "$unit_description" ]] || return 1
+                sudo -n systemctl stop "$unit" || failed=1
+              fi
+              # Observe asynchronous collection of this unit only; never recreate it.
+              for _ in {1..30}; do
+                if { [[ -z "$cgroup_dir" ]] || [[ ! -d "$cgroup_dir" ]]; } && { [[ -z "$main_pid" ]] || [[ ! -e "/proc/$main_pid" ]]; }; then break; fi
+                sleep 0.1
+              done
+              if [[ -n "$cgroup_dir" && -d "$cgroup_dir" ]]; then failed=1; fi
+              if [[ -n "$main_pid" && -e "/proc/$main_pid" ]]; then failed=1; fi
+              if (( failed == 0 )); then unit_owned=false; fi
+            fi
+            return "$failed"
+          }
+          
+          finish() {
+            local code=$1 result
+            trap - EXIT INT TERM
+            set +e
+            if ! cleanup; then
+              code=1
+              reason="owned resource cleanup failed during $phase; see stderr"
+            fi
+            if (( code == 0 )); then
+              result='PASS'
+            else
+              result='BLOCKED'
+              reason=${reason:-"$phase failed (exit=$code); see preceding stderr"}
+              printf '::error title=Runner preflight BLOCKED::%s\n' "$reason"
+            fi
+            printf '%s: %s\n' "$result" "${reason:-real systemd/cgroup and Docker probes completed}"
+            {
+              printf '## Runner capability preflight: %s\n\n' "$result"
+              printf '%s\n\n' "${reason:-Real transient service/cgroup and one harmless container created and removed.}"
+              printf 'Run: %s, attempt: %s\n\n' "${GITHUB_RUN_ID:-unknown}" "${GITHUB_RUN_ATTEMPT:-unknown}"
+              printf 'Capability probe only; full application/recovery acceptance remains pending.\n'
+              printf 'Logs and Job Summary only. Actions minutes/billing require prior confirmation.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$code"
+          }
+          trap 'finish $?' EXIT
+          trap 'reason="probe interrupted"; exit 130' INT
+          trap 'reason="probe terminated"; exit 143' TERM
+          
+          [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] || blocked 'requires a GitHub-hosted runner'
+          [[ "${RUNNER_OS:-}" == Linux ]] || blocked 'requires Linux'
+          [[ "${GITHUB_EVENT_NAME:-}" == workflow_dispatch ]] || blocked 'manual dispatch only'
+          [[ "${GITHUB_REF:-}" == refs/heads/main ]] || blocked 'wrong test branch'
+          [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ && "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]] || blocked 'invalid run identity'
+          probe_id="filatov-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          unit="${probe_id}.service"
+          unit_description="FILATOV hosted capability probe $probe_id"
+          probe_dir=$(mktemp -d "$RUNNER_TEMP/filatov-preflight.XXXXXXXX")
+          mkdir "$probe_dir/docker"
+          printf '{}\n' > "$probe_dir/docker/config.json"
+          
+          phase='OS and cgroup metadata'
+          cat /etc/os-release
+          uname -m
+          printf 'PID1='
+          cat /proc/1/comm
+          systemctl --version
+          df -B1 "$RUNNER_TEMP"
+          [[ $(uname -m) == x86_64 ]] || blocked 'requires x86_64 for the future runtime'
+          [[ $(cat /proc/1/comm) == systemd ]] || blocked 'PID1 is not systemd'
+          [[ $(stat -fc %T /sys/fs/cgroup) == cgroup2fs ]] || blocked 'cgroup v2 is unavailable'
+          findmnt -n -o TARGET,FSTYPE,OPTIONS /sys/fs/cgroup
+          sudo -n true
+          
+          phase='local Docker availability'
+          [[ -S /var/run/docker.sock ]] || blocked 'local Docker socket is unavailable'
+          docker_local info --format 'daemon_id={{.ID}} version={{.ServerVersion}} driver={{.Driver}} cgroup_version={{.CgroupVersion}}'
+          [[ $(docker_local info --format '{{.CgroupVersion}}') == 2 ]] || blocked 'Docker does not use cgroup v2'
+          
+          phase='real systemd transient service'
+          if existing=$(systemctl show "$unit" --property=LoadState --value); then
+            :
+          elif [[ "$existing" != not-found ]]; then
+            blocked 'cannot inspect transient unit state; see stderr'
+          fi
+          [[ "$existing" == not-found ]] || blocked 'owned unit name already exists; refusing to adopt it'
+          unit_owned=true
+          sudo -n systemd-run --unit="$unit" --collect --service-type=exec \
+            --description="$unit_description" --slice=system.slice \
+            --property=RuntimeMaxSec=45s --property=TimeoutStopSec=5s \
+            --property=DynamicUser=yes --property=NoNewPrivileges=yes \
+            --property=PrivateNetwork=yes --property=ProtectSystem=strict \
+            --property=ProtectHome=yes --property=TasksMax=8 \
+            --property=MemoryMax=32M /usr/bin/sleep 40
+          [[ $(systemctl show "$unit" --property=Description --value) == "$unit_description" ]] || blocked 'unit ownership mismatch'
+          [[ $(systemctl show "$unit" --property=ActiveState --value) == active ]] || blocked 'transient service is not active'
+          main_pid=$(systemctl show "$unit" --property=MainPID --value)
+          [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || blocked 'transient MainPID is unavailable'
+          control_group=$(systemctl show "$unit" --property=ControlGroup --value)
+          [[ "$control_group" == "/system.slice/$unit" ]] || blocked 'unexpected transient cgroup'
+          cgroup_dir="/sys/fs/cgroup$control_group"
+          grep -Fx "0::$control_group" "/proc/$main_pid/cgroup"
+          grep -Fx "$main_pid" "$cgroup_dir/cgroup.procs"
+          # Write only the probe's own PID back to its own existing cgroup.
+          printf '%s\n' "$main_pid" | sudo -n tee "$cgroup_dir/cgroup.procs" > /dev/null
+          [[ $(cat "$cgroup_dir/pids.max") == 8 ]] || blocked 'own cgroup task limit was not applied'
+          systemctl show "$unit" --property=ActiveState,SubState,MainPID,ControlGroup,TasksMax
+          phase='transient service stop and cgroup removal'
+          cleanup
+          [[ "$unit_owned" == false && ! -d "$cgroup_dir" && ! -e "/proc/$main_pid" ]] || blocked 'own service/cgroup was not terminated'
+          printf 'systemd_cgroup_probe=PASS\n'
+          
+          phase='official tiny probe image'
+          # Public registry access only; no application image/build or registry credentials.
+          docker_local pull hello-world:latest
+          image_id=$(docker_local image inspect hello-world:latest --format '{{.Id}}')
+          [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]] || blocked 'invalid resolved probe image identity'
+          printf 'resolved_probe_image=%s\n' "$image_id"
+          existing=$(docker_local ps -a --filter "name=^/${probe_id}$" --format '{{.ID}}')
+          [[ -z "$existing" ]] || blocked 'owned container name already exists; refusing to adopt it'
+          phase='real isolated harmless container'
+          container_id=$(docker_local create --pull=never --name "$probe_id" --cidfile "$probe_dir/container.cid" \
+            --label "org.filatov.runner-preflight=$probe_id" --network none \
+            --read-only --user 65534:65534 --cap-drop ALL \
+            --security-opt no-new-privileges=true --pids-limit 16 --memory 32m \
+            --restart no "$image_id")
+          [[ "$container_id" =~ ^[a-f0-9]{64}$ ]] || blocked 'invalid owned container ID'
+          docker_local start "$container_id"
+          container_exit=$(docker_local wait "$container_id")
+          [[ "$container_exit" == 0 ]] || blocked "harmless container exited $container_exit"
+          [[ $(docker_local inspect --format '{{.State.Running}}' "$container_id") == false ]] || blocked 'harmless container is still running'
+          removed_id="$container_id"
+          phase='owned container removal'
+          cleanup
+          [[ -z $(docker_local ps -a --no-trunc --filter "id=$removed_id" --format '{{.ID}}') ]] || blocked 'owned container removal was not confirmed'
+          printf 'docker_container_probe=PASS\n'
+          phase='complete'
